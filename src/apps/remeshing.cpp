@@ -45,7 +45,7 @@ void Viewer::process_imgui()
 
     if (ImGui::CollapsingHeader("Remeshing", ImGuiTreeNodeFlags_DefaultOpen))
     {
-        static int feature_angle = 70;
+        static int feature_angle = 25;
         ImGui::PushItemWidth(80);
         ImGui::SliderInt("", &feature_angle, 1, 180);
         ImGui::PopItemWidth();

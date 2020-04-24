@@ -313,6 +313,10 @@ void SurfaceRemeshing::project_to_reference(Vertex v)
         return;
     }
 
+    // HACK: this case should be handled!
+    //if (vfeature_[v])
+        //return;
+
     // find closest triangle of reference mesh
     TriangleKdTree::NearestNeighbor nn = kd_tree_->nearest(points_[v]);
     const Point p = nn.nearest;
@@ -649,7 +653,6 @@ void SurfaceRemeshing::tangential_smoothing(unsigned int iterations)
 {
     Vertex v1, v2, v3, vv;
     Edge e;
-    Scalar w, ww, area;
     Point u, n, t, b;
 
     // add property
@@ -676,26 +679,14 @@ void SurfaceRemeshing::tangential_smoothing(unsigned int iterations)
             {
                 if (vfeature_[v])
                 {
-                    u = Point(0.0);
+                    // build tangent vector of feature curve
                     t = Point(0.0);
-                    ww = 0;
                     int c = 0;
-
                     for (auto h : mesh_.halfedges(v))
                     {
                         if (efeature_[mesh_.edge(h)])
                         {
                             vv = mesh_.to_vertex(h);
-
-                            b = points_[v];
-                            b += points_[vv];
-                            b *= 0.5;
-
-                            w = distance(points_[v], points_[vv]) /
-                                (0.5 * (vsizing_[v] + vsizing_[vv]));
-                            ww += w;
-                            u += w * b;
-
                             if (c == 0)
                             {
                                 t += normalize(points_[vv] - points_[v]);
@@ -703,65 +694,30 @@ void SurfaceRemeshing::tangential_smoothing(unsigned int iterations)
                             }
                             else
                             {
-                                ++c;
                                 t -= normalize(points_[vv] - points_[v]);
+                                ++c;
                             }
                         }
                     }
-
                     assert(c == 2);
-
-                    u *= (1.0 / ww);
-                    u -= points_[v];
                     t = normalize(t);
-                    u = t * dot(u, t);
 
+                    // get update vector
+                    u = minimize_squared_areas(v) - points_[v];
+
+                    // restrict to tangent vector
+                    u = t * dot(u, t);
                     update[v] = u;
                 }
                 else
                 {
-#if 0
-                    u = Point(0.0);
-                    t = Point(0.0);
-                    ww = 0;
+                    // get update vector
+                    u = minimize_squared_areas(v) - points_[v];
 
-                    for (auto h : mesh_.halfedges(v))
-                    {
-                        v1 = v;
-                        v2 = mesh_.to_vertex(h);
-                        v3 = mesh_.to_vertex(mesh_.next_halfedge(h));
-
-                        b = points_[v1];
-                        b += points_[v2];
-                        b += points_[v3];
-                        b *= (1.0 / 3.0);
-
-                        area = norm(cross(points_[v2] - points_[v1],
-                                          points_[v3] - points_[v1]));
-                        w = area /
-                            pow((vsizing_[v1] + vsizing_[v2] + vsizing_[v3]) /
-                                    3.0,
-                                2.0);
-
-                        u += w * b;
-                        ww += w;
-                    }
-
-                    u /= ww;
-                    u -= points_[v];
+                    // restrict to tangent plane
                     n = vnormal_[v];
                     u -= n * dot(u, n);
-
                     update[v] = u;
-#else
-                    Point p = minimize_squared_areas(v);
-                    u = p - mesh_.position(v);
-
-                    n = vnormal_[v];
-                    u -= n * dot(u, n);
-
-                    update[v] = u;
-#endif
                 }
             }
         }
@@ -772,6 +728,7 @@ void SurfaceRemeshing::tangential_smoothing(unsigned int iterations)
             if (!mesh_.is_boundary(v) && !vlocked_[v])
             {
                 points_[v] += update[v];
+                project_to_reference(v);
             }
         }
 
@@ -855,30 +812,47 @@ void SurfaceRemeshing::remove_caps()
 
 //-----------------------------------------------------------------------------
 
+void perp(const Point& n, Point& u, Point& v)
+{
+    // which component is minimal?
+    int i=0;
+    Scalar s=fabs(n[0]);
+    if (fabs(n[1]) < s) s=fabs(n[i=1]);
+    if (fabs(n[2]) < s) s=fabs(n[i=2]);
+
+    // find u,v spanning orthogonal plane
+    Point e(0.0, 0.0, 0.0); e[i]=1.0;
+    u = normalize(cross(e, n));
+    v = normalize(cross(n, u));
+    //u = normalize(cross(v, n));
+
+    Scalar err = fabs(dot(u,v)) + fabs(dot(u,n)) + fabs(dot(v,n));
+    if (err > 1e-7) PMP_SHOW(err);
+}
+
+//-----------------------------------------------------------------------------
+
 Point SurfaceRemeshing::minimize_squared_areas(Vertex v)
 {
-    // setup matrix of one-ring neighbors' positions
-    const unsigned int n = mesh_.valence(v);
-    Eigen::MatrixXd poly(n,3);
-    int i=0;
-    for (auto vv: mesh_.vertices(v))
-    {
-        poly.row(i++) = (Eigen::Vector3d)points_[vv];
-    }
-
-
     // build Hessian and Jacobian
     Eigen::Matrix3d H;
     H.setZero();
     Eigen::Vector3d J;
     J.setZero();
-    for (unsigned int i = 0; i < n; ++i) 
+    for (auto h: mesh_.halfedges(v))
     {
-        Eigen::Vector3d p = poly.row(i);
-        Eigen::Vector3d q = poly.row((i + 1) % n);
-        Eigen::Vector3d d = p - q;
+        if (mesh_.is_boundary(h))
+            continue;
 
-        double w = 1.0 / d.norm();
+        const Vertex vp = mesh_.to_vertex(h);
+        const Vertex vq = mesh_.to_vertex(mesh_.next_halfedge(h));
+        const Eigen::Vector3d p = (Eigen::Vector3d) points_[vp];
+        const Eigen::Vector3d q = (Eigen::Vector3d) points_[vq];
+        const Eigen::Vector3d d = p - q;
+        
+        double w = d.norm();
+        if (w > FLT_MIN) w = 1.0 / w;
+        else continue;
 
         H(0, 0) += w * (d(1) * d(1) + d(2) * d(2));
         H(1, 0) += w * (-d(0) * d(1));
@@ -897,8 +871,40 @@ Point SurfaceRemeshing::minimize_squared_areas(Vertex v)
         J(2) += w * (d(0) * p(2) * q(0) + d(1) * p(2) * q(1) - d(0) * p(0) * q(2) - d(1) * p(1) * q(2));
     }
 
+
+#if 1
+
     // compute minimizer
     Eigen::Vector3d x = H.lu().solve(-J);
+
+#else
+
+    // restrict to tangent plane
+    Point N, U, V;
+    N = vnormal_[v];
+    perp(N, U, V);
+    Eigen::Matrix<double, 3, 2> T;
+    T.col(0) = (Eigen::Vector3d)U;
+    T.col(1) = (Eigen::Vector3d)V;
+  
+    // solve linear system
+    Eigen::Matrix2d A = T.transpose() * H * T;
+    Eigen::Vector2d b = J.transpose() * T;
+    Eigen::Vector2d uv = A.lu().solve(-b);
+
+    // build 3D point from u,v
+    Point x = points_[v] + uv[0]*U + uv[1]*V;
+    
+    //PMP_SHOW(H);
+    //PMP_SHOW(T);
+    //PMP_SHOW(A);
+    //PMP_SHOW(N);
+    //PMP_SHOW(U);
+    //PMP_SHOW(V);
+    //PMP_SHOW(uv);
+    //PMP_SHOW(x);
+
+#endif
 
     return Point(x);
 }
